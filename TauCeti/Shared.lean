@@ -2,9 +2,9 @@
 region, the bottom marker is where independent additions go. -/
 namespace Scratch
 
-def sharedValue : Nat := 0
+def sharedValue : Nat := 22
 
-theorem sharedValue_eq : sharedValue = 0 := rfl
+theorem sharedValue_eq : sharedValue = 22 := rfl
 
 theorem shared_true : True := trivial
 
