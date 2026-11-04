@@ -1,0 +1,144 @@
+name: pr-build
+# Adapted from TauCetiProject/TauCeti's .github/workflows/pr-build.yml for the queue cutover
+# rehearsal. Kept identical to what the queue service relies on: the `repository_dispatch` event
+# `tauceti-bors-staging` with the same `client_payload` (head_sha, base_sha, batch_id, members,
+# base_ref), the same `run-name` the service finds the run by, a build job named `sandboxed-build`
+# whose log carries lake's `error: TauCeti/...lean:line:col:` lines, and a `finalize-merge-group-build`
+# job that posts the `build` commit status on the candidate head with the run's URL as its target
+# (the service binds its verdict to that run id). Dropped: bwrap, caches, audits, lint, scope checks,
+# cache publication, runner picking. The build is `lake build --iofail` on `ubuntu-latest`.
+run-name: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' && format('bors branch={0} batch={1} head={2} base={3}', github.event.client_payload.base_ref || 'unknown', github.event.client_payload.batch_id, github.event.client_payload.head_sha, github.event.client_payload.base_sha) || format('pr-build pr={0} head={1}', github.event.pull_request.number, github.event.pull_request.head.sha) }}
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  repository_dispatch:
+    types: [tauceti-bors-staging]
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: >-
+    pr-build-${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' && (
+      github.event.client_payload.batch_id && github.event.client_payload.head_sha &&
+      github.event.client_payload.base_sha && github.event.client_payload.base_ref &&
+      format('bors-staging-{0}-{1}-{2}-{3}-{4}', github.repository_id, github.event.client_payload.batch_id,
+        github.event.client_payload.head_sha, github.event.client_payload.base_sha, github.event.client_payload.base_ref)
+      || format('bors-staging-run-{0}', github.run_id)
+    ) || github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  IS_BATCH: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
+
+jobs:
+  # Deliberately named as in TauCeti: the service reads this job's log for diagnostics and its
+  # runner for status, and never names a job `build` (that name is the required commit status).
+  sandboxed-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      status-sha: ${{ steps.candidate.outputs.sha }}
+      build-state: ${{ steps.report.outputs.build-state }}
+      build-description: ${{ steps.report.outputs.build-description }}
+    steps:
+      - name: Resolve the candidate
+        id: candidate
+        env:
+          BORS_HEAD_SHA: ${{ github.event.client_payload.head_sha }}
+          BORS_BASE_SHA: ${{ github.event.client_payload.base_sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if [ "$IS_BATCH" = "true" ]; then
+            SHA="$BORS_HEAD_SHA"; BASE="$BORS_BASE_SHA"
+            [[ "$SHA" =~ ^[0-9a-f]{40}$ && "$BASE" =~ ^[0-9a-f]{40}$ ]] || {
+              echo "::error::bors dispatch did not contain two commit SHAs"; exit 1; }
+          else
+            SHA="$PR_HEAD_SHA"; BASE=""
+          fi
+          { echo "sha=$SHA"; echo "base=$BASE"; } >> "$GITHUB_OUTPUT"
+      - name: Check out the candidate
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.candidate.outputs.sha }}
+          persist-credentials: false
+      - name: Restore the pinned toolchain
+        id: toolchain-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.elan
+          key: elan-${{ runner.os }}-${{ hashFiles('lean-toolchain') }}
+      - name: Install elan
+        if: steps.toolchain-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL https://github.com/leanprover/elan/releases/latest/download/elan-init.sh \
+            | sh -s -- -y --default-toolchain none
+      - name: Build
+        id: build
+        run: |
+          export PATH="$HOME/.elan/bin:$PATH"
+          lake build --iofail
+      - name: Report the build status
+        id: report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ steps.candidate.outputs.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: |
+          case "$BUILD_OUTCOME" in
+            success) state=success; desc="Build succeeded" ;;
+            failure) state=failure; desc="Build failed: lake build --iofail reported errors" ;;
+            *) state=failure; desc="infrastructure: the build step did not run ($BUILD_OUTCOME)" ;;
+          esac
+          { echo "build-state=$state"; echo "build-description=$desc"; } >> "$GITHUB_OUTPUT"
+          # PR heads are reported immediately; a candidate is reported by the finalizer job below.
+          if [ "$IS_BATCH" != "true" ]; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" -f context=build -f state="$state" \
+              -f description="$desc" -f target_url="$RUN_URL" > /dev/null
+          fi
+          [ "$state" = success ]
+
+  finalize-merge-group-build:
+    needs: sandboxed-build
+    if: ${{ always() && github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      statuses: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      STATUS_SHA: ${{ needs.sandboxed-build.outputs.status-sha || github.event.client_payload.head_sha }}
+      BUILD_JOB_RESULT: ${{ needs.sandboxed-build.result }}
+      BUILD_STATE: ${{ needs.sandboxed-build.outputs.build-state }}
+      BUILD_DESCRIPTION: ${{ needs.sandboxed-build.outputs.build-description }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Post the terminal merge-group build status
+        run: |
+          state="$BUILD_STATE"; desc="$BUILD_DESCRIPTION"
+          if [ -z "$state" ]; then
+            state=failure; desc="infrastructure: build job ended as $BUILD_JOB_RESULT without a result"
+          fi
+          # Rehearsal hook (stale-status scenario): a candidate carrying .rehearsal/suppress-build-status
+          # with a number N keeps this finalizer silent while fewer than N `build` statuses exist on the
+          # candidate, and waits so the rehearsal can plant a status from another run first. The real
+          # finalizer has no such hook; a candidate without the file is reported exactly as TauCeti's is.
+          threshold=$(gh api "repos/$GITHUB_REPOSITORY/contents/.rehearsal/suppress-build-status?ref=$STATUS_SHA" \
+            --jq .content 2>/dev/null | base64 -d 2>/dev/null | tr -dc '0-9' || true)
+          if [ -n "$threshold" ]; then
+            existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$STATUS_SHA/statuses" \
+              --jq '.[] | select(.context == "build") | .id' | wc -l | tr -d ' ')
+            if [ "$existing" -lt "$threshold" ]; then
+              echo "rehearsal: suppressing the build status ($existing of $threshold present); waiting 150 s"
+              sleep 150
+              exit 0
+            fi
+          fi
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$STATUS_SHA" -f context=build -f state="$state" \
+            -f description="$desc" -f target_url="$RUN_URL" > /dev/null
+          echo "posted build=$state on $STATUS_SHA: $desc"

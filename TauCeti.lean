@@ -1,0 +1,1 @@
+-- The library root is intentionally empty, as TauCeti's is; `lake build` builds TauCeti/*.

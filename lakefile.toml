@@ -1,0 +1,10 @@
+name = "TauCeti"
+defaultTargets = ["TauCeti"]
+# Pure Lean, as TauCeti: module outputs are reusable across platforms.
+platformIndependent = true
+
+# The library keeps TauCeti's name so the queue's diagnostics reader (`tauceti_queue/diagnostics.py`,
+# which recognises `TauCeti/...lean` paths) and the repair agent's module conventions apply unchanged.
+[[lean_lib]]
+name = "TauCeti"
+globs = ["TauCeti.*"]
