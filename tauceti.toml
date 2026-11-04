@@ -1,0 +1,38 @@
+# Project configuration of the queue rehearsal's scratch repository. The staging path of
+# .github/workflows/pr-build.yml is TauCeti's: the TauCetiTools setup action reads this file,
+# exports TAUCETI_* (including TAUCETI_BORS_URL) and materializes the shared scripts with
+# services.bors.url and repository_id substituted into bors_observation.py, which
+# bors_train_identity.py and finalize_batch.py read the observation feed through.
+schema_version = 1
+
+[project]
+name = "TauCetiQueueScratch"
+branch = "main"
+
+[repositories]
+content = "TauCetiProject/TauCetiQueueScratch"
+# Required by the schema; nothing in the rehearsal reads a roadmap.
+roadmap = "TauCetiProject/TauCetiQueueScratch"
+
+[lean]
+roots = ["TauCeti"]
+
+[merge]
+backend = "bors"
+checks = ["build"]
+
+# The queue service under rehearsal, as CI must reach it: the Namespace runners that serve this
+# repository cannot reach the rehearsal's local listener (http://127.0.0.1:8781), and the schema
+# accepts HTTPS only. Expose the rehearsal service at this address (a Cloudflare tunnel hostname,
+# as queue.taucetiproject.org is served) and give the service the same public_url; the runner
+# fails closed ("bors identity unavailable") while nothing answers here. The feed's `repo` must
+# be this repository, so production (queue.taucetiproject.org) can never stand in.
+[services.bors]
+mode = "custom"
+url = "https://queue-rehearsal.taucetiproject.org"
+repository_id = 1
+deployment = "cloudflare"
+
+[tools.tools]
+repo = "TauCetiProject/TauCetiTools"
+ref = "8bad7a00af97c00c90a9777c195618c857dbf91c"
